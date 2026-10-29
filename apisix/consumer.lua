@@ -22,10 +22,12 @@ local plugin_checker = require("apisix.plugin").plugin_checker
 local check_schema   = require("apisix.core.schema").check
 local error          = error
 local ipairs         = ipairs
+local next           = next
 local pairs          = pairs
 local type           = type
 local tostring       = tostring
 local string_sub     = string.sub
+local ngx            = ngx
 local consumers
 
 
@@ -215,6 +217,7 @@ local has_pending = false
 local pending_delete = false    -- a delete event was seen; reconcile removed ids
 local cred_by_consumer = {}     -- consumer_name -> { credential_entity_id -> true }
 local KV_TTL = 300              -- seconds; refresh bound for secret-backed auth values
+local KV_BUILD_ATTEMPTS = 3     -- consumers_kv rebuilds before giving up on publishing
 
 -- Entity ids are the key relative to /consumers: "jack" for a consumer,
 -- "jack/credentials/cred-1" for a credential. These helpers let the parent
@@ -231,6 +234,9 @@ local function parent_consumer_name(eid)
     return eid
 end
 local tracked_count = 0         -- count of consumers.values at last sync
+-- Snapshot loads replace this table and send no delete events, so a new
+-- table triggers a delete reconcile.
+local tracked_values
 local FULL_SYNC_INTERVAL = 30   -- seconds between background consistency checks
 
 -- key-auth (and the other auth plugins) look consumers up by a key value, not by
@@ -240,21 +246,24 @@ local FULL_SYNC_INTERVAL = 30   -- seconds between background consistency checks
 -- alongside the node arrays: kv_upsert on add/update, kv_remove on delete. The
 -- map lives on the per-plugin data table (pd.kv) and is populated lazily on the
 -- first lookup (which also teaches us pd.key_attr for that plugin).
+--
+-- Resolving a secret ref can yield, so we don't do it here: we mark the map
+-- dirty and the plugin rebuilds it on its next lookup. apply_incremental()
+-- never yields this way.
 local function kv_upsert(pd, consumer)
     if not pd.kv or not pd.key_attr then
         return
     end
-    local nc = core.table.clone(consumer)
-    nc.auth_conf = secret.fetch_secrets(nc.auth_conf, false)
-    -- fail closed: skip unset credentials or unresolved secret refs so a client
-    -- can never authenticate with a literal "$ENV://..." reference string.
-    if secret.has_secret_ref(nc.auth_conf) then
+    if secret.has_secret_ref(consumer.auth_conf) then
+        pd.kv_dirty = true
         return
     end
-    local key_value = nc.auth_conf[pd.key_attr]
+    local key_value = consumer.auth_conf and consumer.auth_conf[pd.key_attr]
     if key_value == nil then
         return
     end
+    local nc = core.table.clone(consumer)
+    nc.auth_conf = core.table.deepcopy(consumer.auth_conf)
     pd.kv[key_value] = nc
     consumer._kvkey = key_value
 end
@@ -371,6 +380,7 @@ local function full_rebuild()
         end
     end
     tracked_count = consumers.values and #consumers.values or 0
+    tracked_values = consumers.values
     cached_conf_version = consumers.conf_version
     core.table.clear(pending_set)
     has_pending = false
@@ -414,7 +424,9 @@ local function apply_incremental()
     -- part), so it stays cheap even with a large consumer base, and it runs only
     -- when a delete actually happened -- independent of whether the net count
     -- went down (e.g. creates and deletes interleaved under churn).
-    if pending_delete then
+    -- Snapshot loads drop records without delete events, so we also reconcile
+    -- when the values table changes.
+    if pending_delete or consumers.values ~= tracked_values then
         local cur_ids = collect_current_ids()
         -- Collect first, then remove (can't modify entry_plugins during pairs iteration)
         local to_remove = {}
@@ -431,6 +443,7 @@ local function apply_incremental()
 
     has_pending = false
     tracked_count = consumers.values and #consumers.values or 0
+    tracked_values = consumers.values
 
     -- Update conf_version on all plugin data; keep the (incrementally maintained)
     -- key_value map version in lockstep so _M.consumers_kv() serves it without a
@@ -503,6 +516,7 @@ end
 
 function create_consume_cache(consumers_conf, key_attr)
     local consumer_names = {}
+    local node_keys = {}
 
     for _, consumer in ipairs(consumers_conf.nodes) do
         local new_consumer = consumer_lrucache(consumer, nil,
@@ -520,42 +534,66 @@ function create_consume_cache(consumers_conf, key_attr)
 
         else
             consumer_names[key_value] = new_consumer
-            -- Record the key on the node so an incremental delete/update can
-            -- remove this entry from the map (kv_remove). Nodes added later go
-            -- through kv_upsert which sets this too; setting it here covers the
-            -- nodes that were in the initial/full build.
-            consumer._kvkey = key_value
+            node_keys[consumer] = key_value
         end
     end
 
-    return consumer_names
+    -- node_keys lets the caller set node._kvkey (used by kv_remove) only
+    -- when it actually publishes this map.
+    return consumer_names, node_keys
 end
 
 end
 
 
 function _M.consumers_kv(plugin_name, consumer_conf, key_attr)
-    -- consumer_conf is the per-plugin node set from _M.plugin(); the key_value ->
-    -- consumer map is cached on it and maintained incrementally by kv_upsert/
-    -- kv_remove, so it is not rebuilt on every conf_version change. Rebuild only on
-    -- first use, a key_attr change, or a version gap the incremental path missed.
-    -- Rebuild on first use, a key_attr change, a version gap the incremental path
-    -- did not cover, or once the TTL lapses. The TTL preserves the refresh bound
-    -- the previous global lru-cache provided: /secrets or external secret changes
-    -- do not bump conf_version, so secret-backed auth values are re-derived at
-    -- least every KV_TTL seconds.
+    -- The key_value -> consumer map lives on consumer_conf and kv_upsert/
+    -- kv_remove keep it up to date. We rebuild it on first use, when key_attr
+    -- changes, when a version gap slipped past the incremental path, when a
+    -- secret-backed entry changed (kv_dirty), or after KV_TTL. /secrets
+    -- changes don't bump conf_version, so the TTL bounds how stale a resolved
+    -- secret can get.
     local now = ngx.now()
     if consumer_conf.kv and consumer_conf.key_attr == key_attr
+       and not consumer_conf.kv_dirty
        and consumer_conf.kv_version == consumer_conf.conf_version
        and (now - (consumer_conf.kv_built_at or 0)) < KV_TTL then
         return consumer_conf.kv
     end
 
-    consumer_conf.kv = create_consume_cache(consumer_conf, key_attr)
-    consumer_conf.key_attr = key_attr
-    consumer_conf.kv_version = consumer_conf.conf_version
-    consumer_conf.kv_built_at = now
-    return consumer_conf.kv
+    -- Resolving secrets can yield, and another request may run
+    -- apply_incremental() in the meantime. So we build from a copy of the
+    -- nodes and only publish the map if conf_version is still the one we
+    -- started from. If it moved, we build again from the new nodes, up to
+    -- KV_BUILD_ATTEMPTS times; a map built from old nodes never replaces the
+    -- shared one.
+    local kv
+    for _ = 1, KV_BUILD_ATTEMPTS do
+        local version = consumer_conf.conf_version
+        local snapshot = { nodes = core.table.clone(consumer_conf.nodes) }
+        local node_keys
+        kv, node_keys = create_consume_cache(snapshot, key_attr)
+
+        if cached_plugins[plugin_name] ~= consumer_conf then
+            -- a full rebuild replaced this plugin's node set; retry on the new one
+            consumer_conf = cached_plugins[plugin_name]
+            if not consumer_conf then
+                return {}
+            end
+
+        elseif consumer_conf.conf_version == version then
+            for _, node in ipairs(snapshot.nodes) do
+                node._kvkey = node_keys[node]
+            end
+            consumer_conf.kv = kv
+            consumer_conf.key_attr = key_attr
+            consumer_conf.kv_version = version
+            consumer_conf.kv_built_at = now
+            consumer_conf.kv_dirty = nil
+            break
+        end
+    end
+    return kv
 end
 
 
